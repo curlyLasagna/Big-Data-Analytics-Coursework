@@ -17,6 +17,7 @@ def _():
         LabelEncoder,
     )
     from sklearn.feature_selection import chi2, SelectKBest
+    from sklearn.metrics import roc_curve, auc, accuracy_score, roc_auc_score
     import polars as pl
     import altair as alt
     from category_encoders import BinaryEncoder, TargetEncoder, OneHotEncoder
@@ -34,11 +35,12 @@ def _():
         SelectKBest,
         StandardScaler,
         TargetEncoder,
+        accuracy_score,
         alt,
         chi2,
         mo,
         pd,
-        pl,
+        roc_curve,
         train_test_split,
     )
 
@@ -52,7 +54,19 @@ def _(mo):
 @app.cell
 def _(pd):
     df = pd.read_csv("./shopping_trends_updated.csv")
-    df_categorical = list(df.select_dtypes(exclude='number').drop(columns="Subscription Status").columns)
+    df_categorical = list(
+        df.select_dtypes(exclude="number")
+        .drop(columns="Subscription Status")
+        .columns
+    )
+
+    df_categorical = list(
+        df.select_dtypes(exclude="number")
+        .drop(columns="Subscription Status")
+        .columns
+    )
+
+    df.groupby("Subscription Status").count()
     return (df,)
 
 
@@ -65,30 +79,6 @@ def _(mo):
 @app.cell
 def _(df):
     df.groupby("Location").value_counts()
-    return
-
-
-@app.cell
-def _(alt, df):
-    (
-        alt.Chart(df.select("Age"))
-        .mark_boxplot()
-        .encode(
-            alt.Y("Age:Q").scale(zero=False),
-        )
-    )
-    return
-
-
-@app.cell
-def _(df, pl):
-    df.select(pl.col("Subscription Status").value_counts())
-    return
-
-
-@app.cell
-def _(df, pl):
-    df.select(pl.col("Location").value_counts()).unnest("Location")
     return
 
 
@@ -121,6 +111,7 @@ def _(df, train_test_split):
         df["Subscription Status"],
         # 70/30 test size
         test_size=0.3,
+        # Equal representation of locations
         stratify=df["Location"],
     )
     return X_test, X_train, y_test, y_train
@@ -134,16 +125,6 @@ def _(mo):
 
     Set a standard scale to numerical features
     """
-    )
-    return
-
-
-@app.cell
-def _(StandardScaler, X_train):
-    transformer_std = (
-        "std",
-        StandardScaler(),
-        list(X_train.select_dtypes(include="number").columns),
     )
     return
 
@@ -169,22 +150,6 @@ def _(mo):
 
 
 @app.cell
-def _(FunctionTransformer, pd):
-    def bar(x: pd.DataFrame):
-        return x.map({"Yes": 1, "No": 0})
-
-
-    bi_map_func = FunctionTransformer(bar)
-    return (bi_map_func,)
-
-
-@app.cell
-def _(X_train, bi_map_func):
-    bi_map_func.fit_transform(X_train["Subscription Status"])
-    return
-
-
-@app.cell
 def _(mo):
     mo.md(
         r"""
@@ -202,26 +167,10 @@ def _(mo):
     return
 
 
-app._unparsable_cell(
-    r"""
-    transformer_one_hot = 
-    """,
-    name="_"
-)
-
-
 @app.cell
 def _(mo):
     mo.md(r"""### Target Encoding""")
     return
-
-
-app._unparsable_cell(
-    r"""
-    transformer_target = 
-    """,
-    name="_"
-)
 
 
 @app.cell
@@ -251,16 +200,14 @@ def _(FunctionTransformer):
         "Fortnightly": 6,
     }
 
-    label_size_func = FunctionTransformer(lambda x: x.replace(label_size_mapping))
+    label_size_func = FunctionTransformer(
+        lambda x: x.replace(label_size_mapping).infer_objects(copy=False)
+    )
 
-    label_freq_func = FunctionTransformer(lambda x: x.replace(label_freq_mapping))
+    label_freq_func = FunctionTransformer(
+        lambda x: x.replace(label_freq_mapping).infer_objects(copy=False)
+    )
     return label_freq_func, label_size_func
-
-
-@app.cell
-def _(X_train):
-    X_train
-    return
 
 
 @app.cell
@@ -270,9 +217,11 @@ def _(
     OneHotEncoder,
     StandardScaler,
     TargetEncoder,
+    X_test,
     X_train,
     label_freq_func,
     label_size_func,
+    y_test,
     y_train,
 ):
     pre_processing = ColumnTransformer(
@@ -305,7 +254,7 @@ def _(
                     "Season",
                     "Shipping Type",
                     "Payment Method",
-                    "Gender"
+                    "Gender",
                 ],
             ),
             # Target encoding
@@ -314,17 +263,19 @@ def _(
             ("label_size", label_size_func, ["Size"]),
             ("label_freq", label_freq_func, ["Frequency of Purchases"]),
         ],
+        # Keep other columns as is, but this shouldn't be the case because otherwise, we'll get errors
         remainder="passthrough",
     )
 
-    pre_processed_df = pre_processing.fit_transform(X=X_train, y=y_train.replace({"Yes": 1, "No": 0}))
-    return pre_processed_df, pre_processing
+    # Pre process both test and training data
+    pre_processed_df_train = pre_processing.fit_transform(
+        X=X_train, y=y_train.replace({"Yes": 1, "No": 0})
+    )
 
-
-@app.cell
-def _(pre_processed_df):
-    pre_processed_df
-    return
+    pre_processed_df_test = pre_processing.fit_transform(
+        X=X_test, y=y_test.replace({"Yes": 1, "No": 0})
+    )
+    return pre_processed_df_test, pre_processed_df_train
 
 
 @app.cell
@@ -334,38 +285,80 @@ def _(mo):
 
 
 @app.cell
-def _(SelectKBest, chi2, pre_processed_df, y_train):
-    SelectKBest(score_func=chi2, k=10).fit_transform(pre_processed_df.select_dtypes(exclude=[float]), y_train)
-    return
+def _(SelectKBest, chi2, pd, pre_processed_df_train, y_train):
+    feature_scores = (
+        SelectKBest(score_func=chi2, k=5).fit(
+            pre_processed_df_train.select_dtypes(exclude=[float]), y_train
+        )
+    ).scores_
 
-
-@app.cell
-def _(mo):
-    mo.md(r"""## Training""")
-    return
-
-
-@app.cell
-def _():
-    return
-
-
-@app.cell
-def _(pre_processed_df):
-    pre_processed_df.columns[pre_processed_df.isin(["No"]).any()]
-    return
+    feature_scores_df = pd.Series(
+        feature_scores,
+        index=pre_processed_df_train.select_dtypes(exclude=[float]).columns,
+    ).sort_values(ascending=False)
+    return (feature_scores_df,)
 
 
 @app.cell
 def _(
     RandomForestClassifier,
-    X_test,
-    pre_processed_df,
-    pre_processing,
+    accuracy_score,
+    feature_scores_df,
+    pre_processed_df_test,
+    pre_processed_df_train,
     y_test,
     y_train,
 ):
-    RandomForestClassifier().fit(pre_processed_df, y_train).predict(pre_processing.fit_transform(X_test, y_test.replace({"Yes": 1, "No": 0})))
+    y_pred = (
+        RandomForestClassifier(n_estimators=1)
+        .fit(
+            pre_processed_df_train[feature_scores_df.nlargest(2).index.tolist()],
+            y_train,
+        )
+        .predict(
+            pre_processed_df_test[feature_scores_df.nlargest(2).index.tolist()]
+        )
+    )
+
+
+
+    accuracy_score(y_test, y_pred)
+    return (y_pred,)
+
+
+@app.cell
+def _(RandomForestClassifier, pre_processed_df_train, y_train):
+    feature_names = pre_processed_df_train.columns
+
+    sorted(list(zip(feature_names, list(RandomForestClassifier().fit(pre_processed_df_train, y_train).feature_importances_))), key=lambda x: x[1], reverse=True)
+    return
+
+
+@app.cell
+def _(pd, roc_curve, y_pred, y_test):
+    fpr, tpr, thresh = roc_curve(y_test.replace({"Yes": 1, "No": 0}), pd.Series(y_pred).replace({"Yes": 1, "No": 0}), pos_label=1)
+    return fpr, tpr
+
+
+@app.cell
+def _(alt, fpr, pd, tpr):
+    roc_data= pd.DataFrame({'False Positive Rate': fpr,
+        'True Positive Rate': tpr})
+
+    roc_chart = alt.Chart(roc_data).mark_line().encode(
+        x=alt.X('False Positive Rate', title='False Positive Rate'),
+        y=alt.Y('True Positive Rate', title='True Positive Rate'),
+        tooltip=['False Positive Rate', 'True Positive Rate']
+    ).properties(
+        title='ROC Curve'
+    )
+
+    diagonal_line = alt.Chart(pd.DataFrame({'x': [0, 1], 'y': [0, 1]})).mark_line(
+        color='gray',
+        strokeDash=[5, 5]
+    ).encode(x='x', y='y')
+
+    (roc_chart + diagonal_line).interactive()
     return
 
 
